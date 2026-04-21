@@ -156,6 +156,7 @@ def get_peft_model(model, peft_config):
     # PeftModelForCausalLM <- PeftModel
     if peft_config.task_type not in MODEL_TYPE_TO_PEFT_MODEL_MAPPING.keys():
         peft_config = _prepare_lora_config(peft_config, model_config)
+        # import pdb; pdb.set_trace();
         return PeftModel(model, peft_config)
     if not isinstance(peft_config, PromptLearningConfig): # -------------> here
         peft_config = _prepare_lora_config(peft_config, model_config)

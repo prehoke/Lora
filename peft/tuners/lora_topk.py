@@ -58,6 +58,16 @@ class LoraConfig(PeftConfig):
     )
     lora_alpha: int = field(default=32, metadata={"help": "Lora alpha"})
     lora_nums: int = field(default=2, metadata={"help": "Numbers of Lora"})
+    # Conventional TopK router: Top-k(Softmax(g(h)Wr))
+    top_k: int = field(
+        default=2,
+        metadata={"help": "Top-k for conventional TopK routing (Top-k(Softmax(g(h)Wr))). Used when sparsegen_cfg['enabled'] is False."},
+    )
+    topk_renorm: bool = field(
+        default=True,
+        metadata={"help": "Renormalize Top-k weights to sum to 1 (recommended)."},
+    )
+
     blc_alpha: int = field(default=0, metadata={"help": "Alpha of blcloss"})
     blc_weight: int = field(default=0, metadata={"help": "Weight of blcloss"})
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
@@ -131,6 +141,13 @@ class LoraConfig(PeftConfig):
         default=0.01,
         metadata={"help": "Scale for low-rank factors U and V at initialization/forward."},
     )
+    cmole_beta_scale: int = field(
+        default=2,
+    )
+    cmole_use_diag_residual: bool = field(
+        default=True,
+    )
+
 
     def __post_init__(self):
         self.peft_type = PeftType.LORA
@@ -214,6 +231,8 @@ class LoraModel(torch.nn.Module):
             "lora_alpha": self.peft_config.lora_alpha,
             "lora_dropout": self.peft_config.lora_dropout,
             "lora_nums": self.peft_config.lora_nums,
+            "top_k": self.peft_config.top_k,
+            "topk_renorm": self.peft_config.topk_renorm,
             "blc_alpha": self.peft_config.blc_alpha,
             "blc_weight": self.peft_config.blc_weight,
             "fan_in_fan_out": self.peft_config.fan_in_fan_out,
@@ -235,40 +254,13 @@ class LoraModel(torch.nn.Module):
                 # Extract layer index from the module key
                 layer_idx = self._extract_layer_index(key)
 
-                # import pdb; pdb.set_trace();
-                if key.endswith("q_proj"):
-                    proj_heads = getattr(self.model.config, "num_attention_heads")
-                elif key.endswith("v_proj"):
-                    proj_heads = getattr(
-                        self.model.config,
-                        "num_key_value_heads",
-                        getattr(self.model.config, "num_attention_heads"),
-                    )
-                else:
-                    if getattr(self.model.config, "architectures") == ['LlamaForCausalLM']:
-                        proj_heads = getattr(self.model.config, "num_key_value_heads") * 4
-                        # proj_heads = getattr(self.model.config, "num_key_value_heads")
-                        # print(proj_heads)
-                    else:
-                        proj_heads = getattr(self.model.config, "num_attention_heads")
-                if self.peft_config.continuous_mole:
-                    new_module = ContinuousMoLELinear(
-                        target.in_features,
-                        target.out_features,
+                if isinstance(target, torch.nn.Linear) and self.peft_config.enable_lora is None:
+                    new_module = Linear(
+                        target.in_features, target.out_features, 
                         bias=bias,
                         layer_idx=layer_idx,
                         total_layers=total_layers,
-                        num_heads=proj_heads,
-                        num_key_value_heads=getattr(
-                            self.model.config, "num_key_value_heads", proj_heads
-                        ),
-                        cmole_rank_k=self.peft_config.cmole_rank_k,
-                        cmole_router_hidden=self.peft_config.cmole_router_hidden,
-                        cmole_use_lowrank=self.peft_config.cmole_use_lowrank,
-                        cmole_diag_scale=self.peft_config.cmole_diag_scale,
-                        cmole_lowrank_scale=self.peft_config.cmole_lowrank_scale,
-                        **kwargs,
-                    )
+                        **kwargs)
 
                 self._replace_module(parent, target_name, new_module, target)
         if not is_target_modules_in_base_model:
@@ -379,19 +371,14 @@ def mark_only_lora_as_trainable(
     sparsegen: bool=False) -> None:
     for n, p in model.named_parameters():
         # include route_weight
-        if (
-        "lora_" not in n
-        and "to_d" not in n
-        and "to_u" not in n
-        and "to_v" not in n
-        ):
+        if "lora_" not in n:
             p.requires_grad = False
         if lora_freeze:
             if "lora_" in n:
                 p.requires_grad = False
 
         if not router_freeze:
-            if "lora_route" in n or "to_d" in n or "to_u" in n or "to_v" in n:
+            if "lora_route" in n:
                 p.requires_grad = True
         if sparsegen:
             if "sparsegen" in n:
@@ -432,218 +419,198 @@ class LoraLayer:
         self.merge_weights = merge_weights
         self.disable_adapters = False
 
-class ContinuousMoLELinear(nn.Linear, LoraLayer):
-    """
-    Continuous MoLE version of a LoRA linear layer.
 
-    It replaces discrete expert routing:
-        sum_i route_i(x) * B_i A_i
-    with a continuous latent modulation:
-        B_h M_{b,s,h} A
-
-    where
-        M_{b,s,h} = Diag(d_{b,s,h}) + U_{b,s,h} V_{b,s,h}^T
-    """
-
+class Linear(nn.Linear, LoraLayer):
+    # Lora implemented in a dense layer
     def __init__(
         self,
         in_features: int,
         out_features: int,
+        sparsegen_fn=None,
         r: int = 0,
         lora_alpha: int = 1,
+        lora_nums: int = 2,
+        top_k: int = 2,
+        topk_renorm: bool = True,
+        blc_alpha: float = 0.0,
+        blc_weight: float = 0.0,
         lora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,
         merge_weights: bool = True,
         **kwargs,
-    ):  
-        # self.use_lowrank = kwargs.get("cmole_use_lowrank", True)
+    ):
         nn.Linear.__init__(self, in_features, out_features, bias=kwargs.get("bias", True))
         LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
 
-        self.fan_in_fan_out = fan_in_fan_out
-        self.weight.requires_grad = False
+        self.lora_nums = lora_nums
+        self.top_k = top_k
+        self.topk_renorm = topk_renorm
+        self.blc_alpha = blc_alpha
+        self.blc_weight = blc_weight
+        self.fan_in_fan_out = fan_in_fan_out      
+        self.sparsegen = sparsegen_fn
 
-        # ----- infer head layout from model config -----
-        # passed from _find_and_replace
-        self.num_heads = kwargs["num_heads"]
-        self.num_key_value_heads = kwargs.get("num_key_value_heads", self.num_heads)
+        if r > 0:
+            if self.lora_nums > 1:
+                self.lora_route = nn.Linear(in_features, self.lora_nums, bias=False)
+            for i in range(self.lora_nums):
+                self.add_module(
+                    f"lora_A{i}", nn.Linear(in_features, r, bias=False))
+                self.add_module(
+                    f"lora_B{i}", nn.Linear(r, out_features, bias=False))
 
-        # q_proj uses num_heads; v_proj uses num_key_value_heads
-        # to keep replacement generic, caller passes the right num_heads for this module
-        assert out_features % self.num_heads == 0, (
-            f"out_features={out_features} must be divisible by num_heads={self.num_heads}"
-        )
-        self.head_dim = out_features // self.num_heads
-
-        # ----- Continuous MoLE hyperparams -----
-        self.rank_k = kwargs.get("cmole_rank_k", 2)
-        self.router_hidden = kwargs.get("cmole_router_hidden", 128)
-        self.use_lowrank = kwargs.get("cmole_use_lowrank", True)
-        self.diag_scale = kwargs.get("cmole_diag_scale", 0.1)
-        self.lowrank_scale = kwargs.get("cmole_lowrank_scale", 0.01)
-
-        # ----- shared basis A -----
-        # A: (r, in_features)
-        self.lora_A_shared = nn.Linear(in_features, r, bias=False)
-
-        # ----- head-wise B -----
-        # one B_h per head block, implemented as a single parameter:
-        # B_heads: (num_heads, head_dim, r)
-        self.lora_B_heads = nn.Parameter(torch.zeros(self.num_heads, self.head_dim, r))
-
-        # ----- router -----
-        # input z = [x, c_token, c_head]  -> dim = in_features + 2
-        # self.lora_route = nn.Sequential(
-        #     nn.Linear(in_features + 2, self.router_hidden, bias=False),
-        #     nn.GELU(),
-        #     nn.Linear(self.router_hidden, self.router_hidden, bias=False),
-        #     nn.GELU(),
-        # )
-        # self.to_d = nn.Linear(self.router_hidden, r, bias=False)
-        self.use_token_consensus = kwargs.get("cmole_use_token_consensus", True)
-
-        token_in_dim = r + (1 if self.use_token_consensus else 0)
-
-        self.token_router_in = nn.Linear(token_in_dim, self.router_hidden, bias=False)
-        self.head_router_in = nn.Linear(1, self.router_hidden, bias=False)
-
-        # one learned embedding per head, shape [H, Hid]
-        self.head_embed = nn.Parameter(torch.zeros(self.num_heads, self.router_hidden))
-
-        self.lora_route_post = nn.Sequential(
-            nn.GELU(),
-            nn.Linear(self.router_hidden, self.router_hidden, bias=False),
-            nn.GELU(),
-        )
-
-        self.to_d = nn.Linear(self.router_hidden, r, bias=False)
-
-        if self.use_lowrank:
-            self.to_u = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
-            self.to_v = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
-
-        if self.use_lowrank:
-            self.to_u = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
-            self.to_v = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
-
-        self.scaling = self.lora_alpha / self.r if self.r > 0 else 1.0
-
+            self.scaling = self.lora_alpha / self.r
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
         self.reset_parameters()
-
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
 
     def reset_parameters(self):
         nn.Linear.reset_parameters(self)
-
-        if hasattr(self, "lora_A_shared"):
-            nn.init.kaiming_uniform_(self.lora_A_shared.weight, a=math.sqrt(5))
-
-        if hasattr(self, "lora_B_heads"):
-            nn.init.zeros_(self.lora_B_heads)
-
-        if hasattr(self, "to_d"):
-            nn.init.zeros_(self.to_d.weight)
-        if hasattr(self, "to_u"):
-            # nn.init.zeros_(self.to_u.weight)
-            nn.init.kaiming_uniform_(self.to_u.weight, a=math.sqrt(5))
-        if hasattr(self, "to_v"):
-            nn.init.zeros_(self.to_v.weight)
-            # nn.init.kaiming_uniform_(self.to_v.weight, a=math.sqrt(5))
-        # if self.use_lowrank:
-        #     nn.init.zeros_(self.to_u.weight)
-        #     nn.init.zeros_(self.to_v.weight)
-        if hasattr(self, "head_embed"):
-            nn.init.zeros_(self.head_embed)
-
-    def _compute_consensus(self, head_out):
-        """
-        head_out: [B, S, H, Dh]
-        returns:
-            c_token: [B, S, 1]
-            c_head:  [B, S, H]
-        """
-        center = head_out.mean(dim=2, keepdim=True)  # [B, S, 1, Dh]
-        cos_sim = F.cosine_similarity(head_out, center, dim=-1)  # [B, S, H]
-        c_head = 1.0 - cos_sim
-        c_token = c_head.mean(dim=2, keepdim=True)  # [B, S, 1]
-        return c_token, c_head
-
+        if hasattr(self, "lora_A0"):
+            for i in range(self.lora_nums):
+                # We want AxB = 0 initially, but we can init A with 0 because it will cause gradient problem so we do B to 0.
+                # If do A, B both none zero, it's going to have distribution shift
+                nn.init.kaiming_uniform_(getattr(self, f"lora_A{i}").weight, a=math.sqrt(5))
+                nn.init.zeros_(getattr(self, f"lora_B{i}").weight)
+        if hasattr(self, "lora_route"):
+            nn.init.kaiming_uniform_(self.lora_route.weight, a=math.sqrt(5))
     def forward(self, x: torch.Tensor):
-        """
-        x: [B, S, in_features]
-        return: LoraOutput with results [B, S, out_features]
-        """
-        B, S, _ = x.shape
-
         base = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+        if self.disable_adapters or self.r == 0 or self.merged:
+            return base
 
-        if self.disable_adapters or self.r == 0:
-            return LoraOutput(
-                results=base,
-                routing_weight=None,
-                gate_score=None,
-                lam=None,
-            )
+        x_drop = self.lora_dropout(x)
+        gate_score, routing_weight, lam = None, None, None
 
-        x_drop = self.lora_dropout(x)                                  # [B, S, Din]
+        # ---- case: single expert (no router) ----
+        if self.lora_nums == 1:
+            lora0 = getattr(self, "lora_B0")(getattr(self, "lora_A0")(x_drop))
+            result = base + lora0 * self.scaling
+            # print("single lora")
+            return LoraOutput(results=result, routing_weight=None, gate_score=None, lam=None)
 
-        # shared reduction: u = A x
-        u = self.lora_A_shared(x_drop)                                 # [B, S, r]
+        # ---- router logits ----
+        # keep repo behavior: sparsegen uses x_drop, otherwise uses x
+        gate_score = self.lora_route(x_drop) if self.sparsegen else self.lora_route(x)
+        # ---- Top-k(Softmax(g(h)Wr)) ----
+        probs = torch.softmax(gate_score.float(), dim=-1)          # [B,S,E]
+        k = int(self.top_k) if self.top_k is not None else self.lora_nums
+        k = max(1, min(k, self.lora_nums))
+        topk_vals, topk_idx = torch.topk(probs, k=k, dim=-1)       # [B,S,k], [B,S,k]
+        if self.topk_renorm and k < self.lora_nums:
+            topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-9)
 
-        # expand only low-rank latent to head axis
-        u_head = u.unsqueeze(2).expand(-1, -1, self.num_heads, -1)     # [B, S, H, r]
+        # build sparse routing_weight for logging / losses
+        routing_weight = torch.zeros_like(probs, dtype=base.dtype) # [B,S,E]
+        routing_weight.scatter_(-1, topk_idx, topk_vals.to(base.dtype))
+        lam = None
 
-        # -------- consensus from base output instead of B_head proxy --------
-        # base: [B, S, out_features] -> [B, S, H, Dh]
-        base_h = base.view(B, S, self.num_heads, self.head_dim)
-        c_token, c_head = self._compute_consensus(base_h.detach())     # [B,S,1], [B,S,H]
+        # ---- compute-sparse LoRA: only evaluate selected experts ----
+        B, S, in_dim = x_drop.shape
+        out_dim = base.shape[-1]
+        N = B * S
 
-        # -------- router: g_{b,s} = f_token([u, c_token]) --------
-        if self.use_token_consensus:
-            token_in = torch.cat([u, c_token], dim=-1)                 # [B, S, r+1]
-        else:
-            token_in = u                                               # [B, S, r]
+        acc_dtype = torch.float32
+        x_flat = x_drop.reshape(N, in_dim).to(acc_dtype)
+        idx_flat = topk_idx.reshape(N, k)
+        val_flat = topk_vals.reshape(N, k).to(acc_dtype)
 
-        g_token = self.token_router_in(token_in)                       # [B, S, Hid]
-        g_token = g_token.unsqueeze(2)                                 # [B, S, 1, Hid]
+        lora_accum = torch.zeros((N, out_dim), device=x.device, dtype=acc_dtype)
 
-        # -------- router: f_head(c_head) + e_h --------
-        g_head = self.head_router_in(c_head.unsqueeze(-1))             # [B, S, H, Hid]
-        g_head = g_head + self.head_embed.view(1, 1, self.num_heads, self.router_hidden)
+        for e in range(self.lora_nums):
+            mask_e = (idx_flat == e)                  # [N,k] bool
+            if not mask_e.any():
+                continue
+            w_all = (val_flat * mask_e.to(acc_dtype)).sum(dim=-1)  # [N]
+            pos = torch.nonzero(w_all > 0, as_tuple=False).squeeze(1)
+            if pos.numel() == 0:
+                continue
 
-        # -------- fuse token/shared + head-specific --------
-        h = self.lora_route_post(g_token + g_head)                     # [B, S, H, Hid]
+            x_sel = x_flat.index_select(0, pos)       # [n_sel, in_dim]
+            w_sel = w_all.index_select(0, pos).unsqueeze(-1)  # [n_sel, 1]
 
-        # diagonal gate
-        d_raw = self.to_d(h)                                           # [B, S, H, r]
-        d = 1.0 + self.diag_scale * torch.tanh(d_raw)                  # [B, S, H, r]
+            A = getattr(self, f"lora_A{e}")
+            Bm = getattr(self, f"lora_B{e}")
+            out_sel = Bm(A(x_sel)).to(acc_dtype)                 # [n_sel, out_dim]
+            lora_accum.index_add_(0, pos, out_sel * w_sel)
 
-        diag_part = d * u_head                                         # [B, S, H, r]
-
-        if self.use_lowrank:
-            U = self.to_u(h).view(B, S, self.num_heads, self.r, self.rank_k)   # [B,S,H,r,k]
-            V = self.to_v(h).view(B, S, self.num_heads, self.r, self.rank_k)   # [B,S,H,r,k]
-
-            # (U V^T) u = U (V^T u)
-            vt_u = torch.einsum("bshrk,bshr->bshk", V, u_head)         # [B,S,H,k]
-            lowrank_part = self.lowrank_scale * torch.einsum(
-                "bshrk,bshk->bshr", U, vt_u
-            )                                                          # [B,S,H,r]
-
-            u_mod = diag_part + lowrank_part                           # [B,S,H,r]
-        else:
-            u_mod = diag_part
-
-        # head-wise projection by B_h
-        lora_out_h = torch.einsum("hdr,bshr->bshd", self.lora_B_heads, u_mod)  # [B,S,H,Dh]
-        lora_result = lora_out_h.reshape(B, S, self.out_features)
-
+        lora_result = lora_accum.to(base.dtype).reshape(B, S, out_dim)
         result = base + lora_result * self.scaling
 
-        return LoraOutput(
-            results=result,
-            routing_weight=None,
-            gate_score=d,
-            lam=None,
-        )
+        return LoraOutput(results=result, routing_weight=routing_weight, gate_score=gate_score, lam=lam)
+    # def forward(self, x: torch.Tensor):
+    #     base = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+    #     if self.disable_adapters or self.r == 0 or self.merged:
+    #         return base
+
+    #     x_drop = self.lora_dropout(x)
+    #     gate_score, routing_weight, lam = None, None, None
+
+    #     # ---- case: single expert (no router) ----
+    #     if self.lora_nums == 1:
+    #         lora0 = getattr(self, "lora_B0")(getattr(self, "lora_A0")(x_drop))
+    #         result = base + lora0 * self.scaling
+    #         return LoraOutput(results=result, routing_weight=None, gate_score=None, lam=None)
+
+    #     # ---- router logits ----
+    #     # keep repo behavior: sparsegen uses x_drop, otherwise uses x
+    #     gate_score = self.lora_route(x_drop) if self.sparsegen else self.lora_route(x)
+
+    #     # ---- Top-k(Softmax(g(h)Wr)) ----
+    #     B, S, in_dim = x_drop.shape
+    #     out_dim = base.shape[-1]
+    #     E = self.lora_nums
+    #     k = int(self.top_k) if self.top_k is not None else E
+    #     k = max(1, min(k, E))
+
+    #     # router probs (fp32 softmax 更稳)
+    #     probs = torch.softmax(gate_score.float(), dim=-1)            # [B,S,E]
+    #     topk_vals, topk_idx = torch.topk(probs, k=k, dim=-1)         # [B,S,k], [B,S,k]
+    #     if self.topk_renorm and k < E:
+    #         topk_vals = topk_vals / (topk_vals.sum(dim=-1, keepdim=True) + 1e-9)
+
+    #     # （可选）为了 logging / loss，构造一个 dense 的 routing_weight
+    #     routing_weight = torch.zeros((B, S, E), device=x.device, dtype=base.dtype)
+    #     routing_weight.scatter_(-1, topk_idx, topk_vals.to(base.dtype))
+    #     lam = None
+
+    #     # ---- SMoE dispatch: one_hot -> where -> index_add_ ----
+    #     N = B * S
+    #     x_flat = x_drop.reshape(N, in_dim)                           # 用原 dtype 跑 LoRA 计算（fp16/bf16）
+    #     topk_idx_flat = topk_idx.reshape(N, k)                       # [N,k]
+    #     topk_val_flat = topk_vals.reshape(N, k)                      # [N,k] fp32
+
+    #     # expert_mask: [E, k, N]  （和你贴的 Linear_MoE 一样）
+    #     expert_mask = torch.nn.functional.one_hot(topk_idx_flat, num_classes=E).permute(2, 1, 0)
+
+    #     # 用 fp32 累加，避免 dtype 问题，也更稳
+    #     acc_dtype = torch.float32
+    #     final_accum = torch.zeros((N, out_dim), device=x.device, dtype=acc_dtype)
+
+    #     for e in range(E):
+    #         # idx: 该 token 在 top-k 的位置(0..k-1), top_x: token 索引(0..N-1)
+    #         idx, top_x = torch.where(expert_mask[e])                 # idx:[M], top_x:[M]
+    #         if top_x.numel() == 0:
+    #             continue
+
+    #         # gather token hidden
+    #         current_state = x_flat.index_select(0, top_x)            # [M, in_dim] (fp16/bf16)
+
+    #         A = getattr(self, f"lora_A{e}")
+    #         Bm = getattr(self, f"lora_B{e}")
+
+    #         # LoRA expert output
+    #         expert_out = Bm(A(current_state))                        # [M, out_dim] (通常 fp16/bf16)
+    #         expert_out = expert_out.to(acc_dtype)                    # 转 fp32 做累加
+
+    #         # gate weights：取每个 token 对应的 top-k 权重（fp32）
+    #         w = topk_val_flat[top_x, idx].to(acc_dtype).unsqueeze(-1)  # [M,1]
+
+    #         final_accum.index_add_(0, top_x, expert_out * w)
+
+    #     lora_result = final_accum.to(base.dtype).reshape(B, S, out_dim)
+    #     result = base + lora_result * self.scaling
+
+    #     return LoraOutput(results=result, routing_weight=routing_weight, gate_score=gate_score, lam=lam)

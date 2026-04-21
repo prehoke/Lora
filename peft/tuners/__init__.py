@@ -17,7 +17,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .lora import LoraConfig, LoraModel, LoraOutput
+# from .lora import LoraConfig, LoraModel, LoraOutput
+# from .lora_householder import LoraConfig, LoraModel, LoraOutput
+from .lora_topk import LoraConfig, LoraModel, LoraOutput
 from .p_tuning import PromptEncoder, PromptEncoderConfig, PromptEncoderReparameterizationType
 from .prefix_tuning import PrefixEncoder, PrefixTuningConfig
 from .prompt_tuning import PromptEmbedding, PromptTuningConfig, PromptTuningInit

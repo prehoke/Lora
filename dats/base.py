@@ -39,7 +39,7 @@ class BaseDataset:
     def format_source(self, source, model_type):
         """Format source text based on model type"""
         # Next token prediction tasks
-        if self.dataset in ['mmlu_pro', 'mmlu', 'arc_e', 'arc_c', 'swag', 'commonsenseqa', 'openbookqa', 'hellaswag']:
+        if self.dataset in ['mmlu_pro', 'mmlu', 'arc_e', 'arc_c', 'swag', 'commonsenseqa', 'openbookqa', 'hellaswag', 'mmlu']:
             if model_type.startswith('qwen'):
                 start_token = '<|im_start|>'
                 end_token = '<|im_end|>'

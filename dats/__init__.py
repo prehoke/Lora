@@ -10,13 +10,14 @@ from .openbookqa import OpenBookQADataset
 from .swag import SWAGDataset
 from .hellaswag import HellaSWAGDataset
 
-from .mrpc import MRPCDataset
+# from .mrpc import MRPCDataset
 from .cola import COLADataset
-from .mnli import MNLIDataset
+# from .mnli import MNLIDataset
 from .rte import RTEDataset
-from .qqp import QQPDataset
-from .sst2 import SST2Dataset
-from .stsb import STSBDataset
+from .mmlu import MMLUDataset
+# from .qqp import QQPDataset
+# from .sst2 import SST2Dataset
+# from .stsb import STSBDataset
 
 from torch.utils.data import DataLoader
 from functools import partial
@@ -157,6 +158,7 @@ def build_dataset(cfg):
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["HF_DATASETS_CACHE"] = cache_dir
     tokenizer = get_tokenizer(cfg, cache_dir=cache_dir)
+    print("dataset.name =", cfg.dataset.name)
     if name == "mmlu_pro":
         tokenized_datasets = {
             'train': MMLUProDataset(cfg, image_set='train', tokenizer=tokenizer),
@@ -193,6 +195,12 @@ def build_dataset(cfg):
             'validation': HellaSWAGDataset(cfg, image_set='val', tokenizer=tokenizer),
             'test': None
         }
+    elif name == "mmlu":
+            tokenized_datasets = {
+                'train': MMLUDataset(cfg, image_set='train', tokenizer=tokenizer),
+                'validation': MMLUDataset(cfg, image_set='val', tokenizer=tokenizer),
+                'test': None
+            }
     elif name == 'glue':
         if task == 'mrpc':
             tokenized_datasets = {

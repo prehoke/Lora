@@ -245,12 +245,7 @@ class LoraModel(torch.nn.Module):
                         getattr(self.model.config, "num_attention_heads"),
                     )
                 else:
-                    if getattr(self.model.config, "architectures") == ['LlamaForCausalLM']:
-                        proj_heads = getattr(self.model.config, "num_key_value_heads") * 4
-                        # proj_heads = getattr(self.model.config, "num_key_value_heads")
-                        # print(proj_heads)
-                    else:
-                        proj_heads = getattr(self.model.config, "num_attention_heads")
+                    proj_heads = getattr(self.model.config, "num_attention_heads")
                 if self.peft_config.continuous_mole:
                     new_module = ContinuousMoLELinear(
                         target.in_features,
@@ -493,34 +488,13 @@ class ContinuousMoLELinear(nn.Linear, LoraLayer):
 
         # ----- router -----
         # input z = [x, c_token, c_head]  -> dim = in_features + 2
-        # self.lora_route = nn.Sequential(
-        #     nn.Linear(in_features + 2, self.router_hidden, bias=False),
-        #     nn.GELU(),
-        #     nn.Linear(self.router_hidden, self.router_hidden, bias=False),
-        #     nn.GELU(),
-        # )
-        # self.to_d = nn.Linear(self.router_hidden, r, bias=False)
-        self.use_token_consensus = kwargs.get("cmole_use_token_consensus", True)
-
-        token_in_dim = r + (1 if self.use_token_consensus else 0)
-
-        self.token_router_in = nn.Linear(token_in_dim, self.router_hidden, bias=False)
-        self.head_router_in = nn.Linear(1, self.router_hidden, bias=False)
-
-        # one learned embedding per head, shape [H, Hid]
-        self.head_embed = nn.Parameter(torch.zeros(self.num_heads, self.router_hidden))
-
-        self.lora_route_post = nn.Sequential(
+        self.lora_route = nn.Sequential(
+            nn.Linear(in_features + 2, self.router_hidden, bias=False),
             nn.GELU(),
             nn.Linear(self.router_hidden, self.router_hidden, bias=False),
             nn.GELU(),
         )
-
         self.to_d = nn.Linear(self.router_hidden, r, bias=False)
-
-        if self.use_lowrank:
-            self.to_u = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
-            self.to_v = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
 
         if self.use_lowrank:
             self.to_u = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
@@ -553,8 +527,6 @@ class ContinuousMoLELinear(nn.Linear, LoraLayer):
         # if self.use_lowrank:
         #     nn.init.zeros_(self.to_u.weight)
         #     nn.init.zeros_(self.to_v.weight)
-        if hasattr(self, "head_embed"):
-            nn.init.zeros_(self.head_embed)
 
     def _compute_consensus(self, head_out):
         """
@@ -574,76 +546,69 @@ class ContinuousMoLELinear(nn.Linear, LoraLayer):
         x: [B, S, in_features]
         return: LoraOutput with results [B, S, out_features]
         """
-        B, S, _ = x.shape
-
         base = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
-        if self.disable_adapters or self.r == 0:
-            return LoraOutput(
-                results=base,
-                routing_weight=None,
-                gate_score=None,
-                lam=None,
-            )
+        if self.disable_adapters or self.r == 0 or self.merged:
+            return base
 
         x_drop = self.lora_dropout(x)                                  # [B, S, Din]
 
         # shared reduction: u = A x
         u = self.lora_A_shared(x_drop)                                 # [B, S, r]
 
-        # expand only low-rank latent to head axis
-        u_head = u.unsqueeze(2).expand(-1, -1, self.num_heads, -1)     # [B, S, H, r]
+        # cheap proxy for head states:
+        # project u to head axis by repeating; then derive consensus from modulated latent carrier
+        # shape: [B, S, H, r]
+        u_head = u.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
 
-        # -------- consensus from base output instead of B_head proxy --------
-        # base: [B, S, out_features] -> [B, S, H, Dh]
-        base_h = base.view(B, S, self.num_heads, self.head_dim)
-        c_token, c_head = self._compute_consensus(base_h.detach())     # [B,S,1], [B,S,H]
+        # use current B_h to create a lightweight head state for consensus
+        # head_out_proxy: [B, S, H, Dh]
+        head_out_proxy = torch.einsum("hdr,bshr->bshd", self.lora_B_heads, u_head)
 
-        # -------- router: g_{b,s} = f_token([u, c_token]) --------
-        if self.use_token_consensus:
-            token_in = torch.cat([u, c_token], dim=-1)                 # [B, S, r+1]
-        else:
-            token_in = u                                               # [B, S, r]
+        c_token, c_head = self._compute_consensus(head_out_proxy)      # [B,S,1], [B,S,H]
 
-        g_token = self.token_router_in(token_in)                       # [B, S, Hid]
-        g_token = g_token.unsqueeze(2)                                 # [B, S, 1, Hid]
+        # router input z = [x, c_token, c_head]
+        x_expand = x_drop.unsqueeze(2).expand(-1, -1, self.num_heads, -1)   # [B,S,H,Din]
+        c_token_expand = c_token.unsqueeze(2).expand(-1, -1, self.num_heads, -1)  # [B,S,H,1]
+        c_head_expand = c_head.unsqueeze(-1)                           # [B,S,H,1]
 
-        # -------- router: f_head(c_head) + e_h --------
-        g_head = self.head_router_in(c_head.unsqueeze(-1))             # [B, S, H, Hid]
-        g_head = g_head + self.head_embed.view(1, 1, self.num_heads, self.router_hidden)
+        z = torch.cat([x_expand, c_token_expand, c_head_expand], dim=-1)  # [B,S,H,Din+2]
 
-        # -------- fuse token/shared + head-specific --------
-        h = self.lora_route_post(g_token + g_head)                     # [B, S, H, Hid]
+        h = self.lora_route(z)                                         # [B,S,H,Hid]
 
         # diagonal gate
-        d_raw = self.to_d(h)                                           # [B, S, H, r]
-        d = 1.0 + self.diag_scale * torch.tanh(d_raw)                  # [B, S, H, r]
+        d_raw = self.to_d(h)                                           # [B,S,H,r]
+        d = 1.0 + self.diag_scale * torch.tanh(d_raw)                  # [B,S,H,r]
 
-        diag_part = d * u_head                                         # [B, S, H, r]
+        # diagonal modulation
+        diag_part = d * u_head                                         # [B,S,H,r]
 
         if self.use_lowrank:
-            U = self.to_u(h).view(B, S, self.num_heads, self.r, self.rank_k)   # [B,S,H,r,k]
-            V = self.to_v(h).view(B, S, self.num_heads, self.r, self.rank_k)   # [B,S,H,r,k]
+            U = self.lowrank_scale * self.to_u(h).view(
+                x.shape[0], x.shape[1], self.num_heads, self.r, self.rank_k
+            )                                                          # [B,S,H,r,k]
+            V = self.lowrank_scale * self.to_v(h).view(
+                x.shape[0], x.shape[1], self.num_heads, self.r, self.rank_k
+            )                                                          # [B,S,H,r,k]
 
             # (U V^T) u = U (V^T u)
             vt_u = torch.einsum("bshrk,bshr->bshk", V, u_head)         # [B,S,H,k]
-            lowrank_part = self.lowrank_scale * torch.einsum(
-                "bshrk,bshk->bshr", U, vt_u
-            )                                                          # [B,S,H,r]
-
+            lowrank_part = torch.einsum("bshrk,bshk->bshr", U, vt_u)   # [B,S,H,r]
             u_mod = diag_part + lowrank_part                           # [B,S,H,r]
         else:
+            U, V = None, None
             u_mod = diag_part
 
         # head-wise projection by B_h
+        # B_heads: [H, Dh, r], u_mod: [B,S,H,r]
         lora_out_h = torch.einsum("hdr,bshr->bshd", self.lora_B_heads, u_mod)  # [B,S,H,Dh]
-        lora_result = lora_out_h.reshape(B, S, self.out_features)
+        lora_result = lora_out_h.reshape(x.shape[0], x.shape[1], self.out_features)
 
         result = base + lora_result * self.scaling
 
         return LoraOutput(
             results=result,
-            routing_weight=None,
-            gate_score=d,
+            routing_weight=None,   # no discrete expert routing in Continuous MoLE
+            gate_score=d,          # expose diagonal gate for logging
             lam=None,
         )

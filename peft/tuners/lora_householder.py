@@ -27,7 +27,8 @@ import torch.nn.functional as F
 from ..utils import PeftConfig, PeftType, transpose
 from ..utils.sparsegen import GlobalSparsegen
 from transformers.utils import ModelOutput
-
+import os
+from pathlib import Path
 
 @dataclass
 class LoraConfig(PeftConfig):
@@ -130,6 +131,12 @@ class LoraConfig(PeftConfig):
     cmole_lowrank_scale: float = field(
         default=0.01,
         metadata={"help": "Scale for low-rank factors U and V at initialization/forward."},
+    )
+    cmole_beta_scale: int = field(
+        default=2,
+    )
+    cmole_use_diag_residual: bool = field(
+        default=True,
     )
 
     def __post_init__(self):
@@ -247,16 +254,15 @@ class LoraModel(torch.nn.Module):
                 else:
                     if getattr(self.model.config, "architectures") == ['LlamaForCausalLM']:
                         proj_heads = getattr(self.model.config, "num_key_value_heads") * 4
-                        # proj_heads = getattr(self.model.config, "num_key_value_heads")
-                        # print(proj_heads)
                     else:
                         proj_heads = getattr(self.model.config, "num_attention_heads")
                 if self.peft_config.continuous_mole:
-                    new_module = ContinuousMoLELinear(
+                    new_module = ContinuousMoLELinearHouseholder(
                         target.in_features,
                         target.out_features,
                         bias=bias,
                         layer_idx=layer_idx,
+                        module_name=key,
                         total_layers=total_layers,
                         num_heads=proj_heads,
                         num_key_value_heads=getattr(
@@ -267,6 +273,8 @@ class LoraModel(torch.nn.Module):
                         cmole_use_lowrank=self.peft_config.cmole_use_lowrank,
                         cmole_diag_scale=self.peft_config.cmole_diag_scale,
                         cmole_lowrank_scale=self.peft_config.cmole_lowrank_scale,
+                        cmole_beta_scale=self.peft_config.cmole_beta_scale,
+                        cmole_use_diag_residual= self.peft_config.cmole_use_diag_residual,
                         **kwargs,
                     )
 
@@ -432,17 +440,25 @@ class LoraLayer:
         self.merge_weights = merge_weights
         self.disable_adapters = False
 
-class ContinuousMoLELinear(nn.Linear, LoraLayer):
-    """
-    Continuous MoLE version of a LoRA linear layer.
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-    It replaces discrete expert routing:
-        sum_i route_i(x) * B_i A_i
-    with a continuous latent modulation:
-        B_h M_{b,s,h} A
+
+class ContinuousMoLELinearHouseholder(nn.Linear, LoraLayer):
+    """
+    Householder-like upgraded version of your ContinuousMoLELinear.
+
+    Replaces:
+        u_mod = d * u_head
+
+    with:
+        u_mod = u_head - beta * <u_head, w> * w
 
     where
-        M_{b,s,h} = Diag(d_{b,s,h}) + U_{b,s,h} V_{b,s,h}^T
+        w     : input-conditioned head-specific direction in latent rank space
+        beta  : input-conditioned scalar in a small range
     """
 
     def __init__(
@@ -455,59 +471,55 @@ class ContinuousMoLELinear(nn.Linear, LoraLayer):
         fan_in_fan_out: bool = False,
         merge_weights: bool = True,
         **kwargs,
-    ):  
-        # self.use_lowrank = kwargs.get("cmole_use_lowrank", True)
+    ):
         nn.Linear.__init__(self, in_features, out_features, bias=kwargs.get("bias", True))
-        LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=merge_weights)
+        LoraLayer.__init__(
+            self,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            merge_weights=merge_weights,
+        )
 
         self.fan_in_fan_out = fan_in_fan_out
         self.weight.requires_grad = False
 
-        # ----- infer head layout from model config -----
-        # passed from _find_and_replace
+        # ----- infer head layout -----
         self.num_heads = kwargs["num_heads"]
         self.num_key_value_heads = kwargs.get("num_key_value_heads", self.num_heads)
 
-        # q_proj uses num_heads; v_proj uses num_key_value_heads
-        # to keep replacement generic, caller passes the right num_heads for this module
         assert out_features % self.num_heads == 0, (
             f"out_features={out_features} must be divisible by num_heads={self.num_heads}"
         )
         self.head_dim = out_features // self.num_heads
 
-        # ----- Continuous MoLE hyperparams -----
-        self.rank_k = kwargs.get("cmole_rank_k", 2)
+        # ----- router / modulation hyperparams -----
         self.router_hidden = kwargs.get("cmole_router_hidden", 128)
-        self.use_lowrank = kwargs.get("cmole_use_lowrank", True)
+        self.use_token_consensus = kwargs.get("cmole_use_token_consensus", True)
+
+        # Householder-like params
+        # beta in (-beta_scale, beta_scale); beta_scale=2.0 gives classic Householder-like range
+        self.beta_scale = kwargs.get("cmole_beta_scale", 2.0)
+        self.beta_init_zero = kwargs.get("cmole_beta_init_zero", True)
+        self.w_eps = kwargs.get("cmole_w_eps", 1e-6)
+
+        # optional residual diagonal path if you want to mix old/new behavior
+        self.use_diag_residual = kwargs.get("cmole_use_diag_residual", False)
         self.diag_scale = kwargs.get("cmole_diag_scale", 0.1)
-        self.lowrank_scale = kwargs.get("cmole_lowrank_scale", 0.01)
 
         # ----- shared basis A -----
-        # A: (r, in_features)
         self.lora_A_shared = nn.Linear(in_features, r, bias=False)
 
         # ----- head-wise B -----
-        # one B_h per head block, implemented as a single parameter:
-        # B_heads: (num_heads, head_dim, r)
         self.lora_B_heads = nn.Parameter(torch.zeros(self.num_heads, self.head_dim, r))
 
         # ----- router -----
-        # input z = [x, c_token, c_head]  -> dim = in_features + 2
-        # self.lora_route = nn.Sequential(
-        #     nn.Linear(in_features + 2, self.router_hidden, bias=False),
-        #     nn.GELU(),
-        #     nn.Linear(self.router_hidden, self.router_hidden, bias=False),
-        #     nn.GELU(),
-        # )
-        # self.to_d = nn.Linear(self.router_hidden, r, bias=False)
-        self.use_token_consensus = kwargs.get("cmole_use_token_consensus", True)
-
         token_in_dim = r + (1 if self.use_token_consensus else 0)
 
         self.token_router_in = nn.Linear(token_in_dim, self.router_hidden, bias=False)
         self.head_router_in = nn.Linear(1, self.router_hidden, bias=False)
 
-        # one learned embedding per head, shape [H, Hid]
+        # learned embedding per head
         self.head_embed = nn.Parameter(torch.zeros(self.num_heads, self.router_hidden))
 
         self.lora_route_post = nn.Sequential(
@@ -516,15 +528,16 @@ class ContinuousMoLELinear(nn.Linear, LoraLayer):
             nn.GELU(),
         )
 
-        self.to_d = nn.Linear(self.router_hidden, r, bias=False)
+        # ----- Householder-like outputs -----
+        # direction in latent rank space
+        self.to_w = nn.Linear(self.router_hidden, r, bias=False)
 
-        if self.use_lowrank:
-            self.to_u = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
-            self.to_v = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
+        # scalar beta per (b,s,h)
+        self.to_beta = nn.Linear(self.router_hidden, 1, bias=False)
 
-        if self.use_lowrank:
-            self.to_u = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
-            self.to_v = nn.Linear(self.router_hidden, r * self.rank_k, bias=False)
+        # optional diagonal residual gate
+        if self.use_diag_residual:
+            self.to_d = nn.Linear(self.router_hidden, r, bias=False)
 
         self.scaling = self.lora_alpha / self.r if self.r > 0 else 1.0
 
@@ -532,7 +545,47 @@ class ContinuousMoLELinear(nn.Linear, LoraLayer):
 
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
+        
+        print("householder-like")
 
+
+        self.debug_save_dir = "/home/hke3/LD-MoLE/vis/saved_var"
+        self.debug_save_every = 1
+        self.debug_save_dtype = torch.float16
+        self.debug_batch_idx = 0
+        self.layerindex = kwargs.get("layer_idx")
+        self.module_name=kwargs.get("module_name")
+        self.debug_save_fields = ["w", "beta", "base_h","lora_out_h"]
+        
+    def _save_debug_tensors(self, base_h, lora_out_h, w, beta, u_head, u_mod):
+        if self.debug_save_dir is None:
+            return
+
+        from pathlib import Path
+        save_dir = Path(self.debug_save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.debug_batch_idx % self.debug_save_every != 0:
+            self.debug_batch_idx += 1
+            return
+
+        field_map = {
+            "w": w,
+            "beta": beta,
+            "u_head": u_head,
+            "u_mod": u_mod,
+            "base_h": base_h,
+            "lora_out_h":lora_out_h
+        }
+
+        obj = {}
+        for k in self.debug_save_fields:
+            obj[k] = field_map[k].detach().to("cpu", dtype=self.debug_save_dtype)
+
+        save_path = save_dir / f"{self.layerindex}_{self.module_name}_batch_{self.debug_batch_idx:06d}.pt"
+        torch.save(obj, save_path)
+        self.debug_batch_idx += 1
+    
     def reset_parameters(self):
         nn.Linear.reset_parameters(self)
 
@@ -542,41 +595,79 @@ class ContinuousMoLELinear(nn.Linear, LoraLayer):
         if hasattr(self, "lora_B_heads"):
             nn.init.zeros_(self.lora_B_heads)
 
-        if hasattr(self, "to_d"):
-            nn.init.zeros_(self.to_d.weight)
-        if hasattr(self, "to_u"):
-            # nn.init.zeros_(self.to_u.weight)
-            nn.init.kaiming_uniform_(self.to_u.weight, a=math.sqrt(5))
-        if hasattr(self, "to_v"):
-            nn.init.zeros_(self.to_v.weight)
-            # nn.init.kaiming_uniform_(self.to_v.weight, a=math.sqrt(5))
-        # if self.use_lowrank:
-        #     nn.init.zeros_(self.to_u.weight)
-        #     nn.init.zeros_(self.to_v.weight)
         if hasattr(self, "head_embed"):
             nn.init.zeros_(self.head_embed)
 
-    def _compute_consensus(self, head_out):
+        if hasattr(self, "to_w"):
+            nn.init.kaiming_uniform_(self.to_w.weight, a=math.sqrt(5))
+
+        if hasattr(self, "to_beta"):
+            if self.beta_init_zero:
+                nn.init.zeros_(self.to_beta.weight)
+            else:
+                nn.init.kaiming_uniform_(self.to_beta.weight, a=math.sqrt(5))
+
+        if hasattr(self, "to_d"):
+            nn.init.zeros_(self.to_d.weight)
+
+    def _compute_consensus(self, head_out: torch.Tensor):
         """
         head_out: [B, S, H, Dh]
         returns:
             c_token: [B, S, 1]
             c_head:  [B, S, H]
         """
-        center = head_out.mean(dim=2, keepdim=True)  # [B, S, 1, Dh]
+        center = head_out.mean(dim=2, keepdim=True)          # [B, S, 1, Dh]
         cos_sim = F.cosine_similarity(head_out, center, dim=-1)  # [B, S, H]
         c_head = 1.0 - cos_sim
-        c_token = c_head.mean(dim=2, keepdim=True)  # [B, S, 1]
+        c_token = c_head.mean(dim=2, keepdim=True)           # [B, S, 1]
         return c_token, c_head
+
+    def _householder_like(self, u_head: torch.Tensor, h: torch.Tensor):
+        """
+        u_head: [B, S, H, r]
+        h:      [B, S, H, Hid]
+        returns:
+            u_mod: [B, S, H, r]
+            beta:  [B, S, H, 1]
+            w:     [B, S, H, r]
+        """
+        # direction
+        w_raw = self.to_w(h)  # [B, S, H, r]
+        w = F.normalize(w_raw, p=2, dim=-1, eps=self.w_eps)
+
+        # scalar beta
+        beta_raw = self.to_beta(h)  # [B, S, H, 1]
+
+        # identity-friendly init:
+        # if to_beta starts at zero => beta starts at 0 => u_mod ~= u_head
+        beta = self.beta_scale * torch.tanh(beta_raw)
+
+        # projection <u, w>
+        proj = (u_head * w).sum(dim=-1, keepdim=True)  # [B, S, H, 1]
+
+        # Householder-like update
+        u_mod = u_head - beta * proj * w
+
+        # optional residual diagonal gate
+        if self.use_diag_residual:
+            d_raw = self.to_d(h)
+            d = 1.0 + self.diag_scale * torch.tanh(d_raw)
+            u_mod = d * u_mod
+
+        return u_mod, beta, w
 
     def forward(self, x: torch.Tensor):
         """
         x: [B, S, in_features]
-        return: LoraOutput with results [B, S, out_features]
         """
         B, S, _ = x.shape
 
-        base = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+        base = F.linear(
+            x,
+            transpose(self.weight, self.fan_in_fan_out),
+            bias=self.bias,
+        )
 
         if self.disable_adapters or self.r == 0:
             return LoraOutput(
@@ -586,64 +677,44 @@ class ContinuousMoLELinear(nn.Linear, LoraLayer):
                 lam=None,
             )
 
-        x_drop = self.lora_dropout(x)                                  # [B, S, Din]
+        x_drop = self.lora_dropout(x)                      # [B, S, Din]
 
-        # shared reduction: u = A x
-        u = self.lora_A_shared(x_drop)                                 # [B, S, r]
+        # shared latent
+        u = self.lora_A_shared(x_drop)                    # [B, S, r]
+        u_head = u.unsqueeze(2).expand(-1, -1, self.num_heads, -1)  # [B, S, H, r]
 
-        # expand only low-rank latent to head axis
-        u_head = u.unsqueeze(2).expand(-1, -1, self.num_heads, -1)     # [B, S, H, r]
-
-        # -------- consensus from base output instead of B_head proxy --------
-        # base: [B, S, out_features] -> [B, S, H, Dh]
+        # base output -> per-head consensus signal
         base_h = base.view(B, S, self.num_heads, self.head_dim)
-        c_token, c_head = self._compute_consensus(base_h.detach())     # [B,S,1], [B,S,H]
+        c_token, c_head = self._compute_consensus(base_h.detach())
 
-        # -------- router: g_{b,s} = f_token([u, c_token]) --------
+        # token path
         if self.use_token_consensus:
-            token_in = torch.cat([u, c_token], dim=-1)                 # [B, S, r+1]
+            token_in = torch.cat([u, c_token], dim=-1)    # [B, S, r+1]
         else:
-            token_in = u                                               # [B, S, r]
+            token_in = u                                  # [B, S, r]
 
-        g_token = self.token_router_in(token_in)                       # [B, S, Hid]
-        g_token = g_token.unsqueeze(2)                                 # [B, S, 1, Hid]
+        g_token = self.token_router_in(token_in)          # [B, S, Hid]
+        g_token = g_token.unsqueeze(2)                    # [B, S, 1, Hid]
 
-        # -------- router: f_head(c_head) + e_h --------
-        g_head = self.head_router_in(c_head.unsqueeze(-1))             # [B, S, H, Hid]
+        # head path
+        g_head = self.head_router_in(c_head.unsqueeze(-1))   # [B, S, H, Hid]
         g_head = g_head + self.head_embed.view(1, 1, self.num_heads, self.router_hidden)
 
-        # -------- fuse token/shared + head-specific --------
-        h = self.lora_route_post(g_token + g_head)                     # [B, S, H, Hid]
+        # fused router state
+        h = self.lora_route_post(g_token + g_head)        # [B, S, H, Hid]
 
-        # diagonal gate
-        d_raw = self.to_d(h)                                           # [B, S, H, r]
-        d = 1.0 + self.diag_scale * torch.tanh(d_raw)                  # [B, S, H, r]
-
-        diag_part = d * u_head                                         # [B, S, H, r]
-
-        if self.use_lowrank:
-            U = self.to_u(h).view(B, S, self.num_heads, self.r, self.rank_k)   # [B,S,H,r,k]
-            V = self.to_v(h).view(B, S, self.num_heads, self.r, self.rank_k)   # [B,S,H,r,k]
-
-            # (U V^T) u = U (V^T u)
-            vt_u = torch.einsum("bshrk,bshr->bshk", V, u_head)         # [B,S,H,k]
-            lowrank_part = self.lowrank_scale * torch.einsum(
-                "bshrk,bshk->bshr", U, vt_u
-            )                                                          # [B,S,H,r]
-
-            u_mod = diag_part + lowrank_part                           # [B,S,H,r]
-        else:
-            u_mod = diag_part
-
-        # head-wise projection by B_h
-        lora_out_h = torch.einsum("hdr,bshr->bshd", self.lora_B_heads, u_mod)  # [B,S,H,Dh]
+        # Householder-like latent routing
+        u_mod, beta, w = self._householder_like(u_head, h)  # [B, S, H, r]
+        
+        # head-wise projection
+        lora_out_h = torch.einsum("hdr,bshr->bshd", self.lora_B_heads, u_mod)  # [B, S, H, Dh]
         lora_result = lora_out_h.reshape(B, S, self.out_features)
-
+        self._save_debug_tensors(base_h, lora_out_h, w, beta, u_head, u_mod)
         result = base + lora_result * self.scaling
 
         return LoraOutput(
             results=result,
             routing_weight=None,
-            gate_score=d,
+            gate_score=beta,   # you can also return w or proj if you want to analyze
             lam=None,
         )
