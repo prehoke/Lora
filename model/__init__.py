@@ -13,13 +13,14 @@ def build_model(cfg, num_labels=None):
     name = cfg.dataset.get('name', None)
     task = cfg.task.get('name', None)
     model_config = None
+    # import pdb; pdb.set_trace()
     if not num_labels:
         num_labels = cfg.task.get('num_labels', None)
     if model_hf_name:
         cache_dir = os.path.join(os.getcwd(), cfg.dataset.root_dir, model_name, "weights")
         os.makedirs(cache_dir, exist_ok=True)
         # next token prediction task
-        if name in ['mmlu_pro', 'arc_e', 'arc_c', 'swag', 'commonsenseqa', 'openbookqa', 'hellaswag']:
+        if name in ['mmlu_pro', 'arc_e', 'arc_c', 'swag', 'commonsenseqa', 'openbookqa', 'hellaswag', 'mmlu']:
             if cfg.model.name.startswith('qwen3'):
                 model_config = AutoConfig.from_pretrained(
                                                         model_hf_name,
@@ -90,7 +91,7 @@ def build_model(cfg, num_labels=None):
             if cfg.model.get('pad_token_id') is not None:
                 model_config.pad_token_id = cfg.model.pad_token_id
                 print(f"Setting pad_token_id to: {cfg.model.pad_token_id}")
-            elif cfg.model.name.startswith('qwen3'):
+            if cfg.model.name.startswith('qwen3'):
                 if cfg.load_pretrained:
                     print("Loading pretrained model")
                     model = Qwen3ForSequenceClassification.from_pretrained(

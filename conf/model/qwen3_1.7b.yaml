@@ -31,6 +31,13 @@ lora:
     - "score"
     # - "sparsegen"
 
+  continuous_mole: true
+  cmole_rank_k: 2
+  cmole_router_hidden: 128
+  cmole_use_lowrank: false
+  cmole_diag_scale: 0.1
+  cmole_lowrank_scale: 0.01
+  
   sparsegen_cfg:
     enabled: True
     init_strategy: "kaiming" # Options: "kaiming", "dense" (λ≈0, many adapters), "sparse" (λ≈1, few adapters), "zeros"

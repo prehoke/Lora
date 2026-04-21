@@ -3,6 +3,7 @@ import torch.distributed as dist
 
 
 NUM_OPTIONS = {
+    'mmlu': 4,
     'mmlu_pro': 10, 
     'arc_e': 4, 
     'arc_c': 4, 
@@ -17,7 +18,7 @@ def build_validator(config):
     dataset = config.dataset.get('name', None)
     if dataset == 'glue':
         return GlueValidator(config)
-    elif dataset in ['mmlu_pro', 'arc_e', 'arc_c', 'openbookqa', 'swag', 'commonsenseqa', 'hellaswag']:
+    elif dataset in ['mmlu_pro', 'arc_e', 'arc_c', 'openbookqa', 'swag', 'commonsenseqa', 'hellaswag', 'mmlu']:
         return SingleTaskLMValidator(config)
     else:
         raise NotImplementedError(f"Dataset {dataset} is not supported for validation.")
@@ -183,7 +184,7 @@ class SingleTaskLMValidator(BaseValidator):
         data_type = self.dataset_name
 
         for i in range(len(preds)):
-            if data_type in ['mmlu_pro']:
+            if data_type in ['mmlu_pro','mmlu']:
                 subject = all_subjects[i]
                 task_name = subject.replace('_', ' ').title().lower()
             else:
@@ -218,7 +219,7 @@ class SingleTaskLMValidator(BaseValidator):
     def get_results(self):
         metrics_results = {}
         
-        if self.dataset_name in ['mmlu_pro']:
+        if self.dataset_name in ['mmlu_pro','mmlu']:
             for k, v in self.metrics.items():
                 met_name = f"{k}_acc"
                 metrics_results[met_name] = v["accuracy"]

@@ -63,9 +63,14 @@ class Finetuner(LightningModule):
             s = cfg.get("scheduler")
             self.lr_step = s["milestones"]
             self.lr_factor = s["gamma"]
+            self.lr_scheduler_name = s["lr_scheduler_name"]
+            self.warmup_ratio = s["warmup_ratio"]
+            self.eta_min = s["eta_min"]
+            self.use_warmup = s["use_warmup"]
+            self.MultiStepLR_epoch_num = s["MultiStepLR_epoch_num"]
 
         self.output_path = output_path
-    
+        # import pdb; pdb.set_trace()
         self.model = build_model(cfg, cfg.num_labels)
         self.validator = build_validator(cfg)
         self.criterion = build_loss(cfg)
@@ -82,6 +87,7 @@ class Finetuner(LightningModule):
 
         if cfg.model.get("apply_lora", False):
             lora_config = self.init_lora(cfg)
+            self.show_trainable_parameters()
             if cfg.load_lora_pretrained:
                 self.resume_from_checkpoint(cfg, lora_config)
         else:
@@ -100,31 +106,128 @@ class Finetuner(LightningModule):
                     self.regular_params.append(p)
 
         self.save_hyperparameters()
-
+        # import pdb; pdb.set_trace()
+        self.model.print_trainable_parameters()
         trainable_parameter_cnt(self.model, verbose=False)
+
+    def show_trainable_parameters(self):
+        total = 0
+        trainable = 0
+
+        print("==== Trainable parameters ====")
+        for name, param in self.model.named_parameters():
+            num = param.numel()
+            total += num
+            if param.requires_grad:
+                trainable += num
+                print(f"{name:80s} | shape={tuple(param.shape)} | numel={num}")
+
+        print(f"\ntrainable params: {trainable}")
+        print(f"all params:       {total}")
+        print(f"trainable%:       {100 * trainable / total:.4f}%")
 
     def init_lora(self, cfg):
         lora_meta_config = cfg.model.get("lora", None)
         lora_meta_config = OmegaConf.to_container(lora_meta_config, resolve=True)
         lora_config = LoraConfig(**lora_meta_config)
-        self.model = get_peft_model(self.model, lora_config)
+        # import pdb; pdb.set_trace();
+        self.model = get_peft_model(self.model, lora_config)       
         return lora_config
 
     def configure_optimizers(self):
         if self.sparsegen==True:
             optimizer = torch.optim.AdamW([
                 {'params': self.regular_params, 'lr': self.lr},
+                {'params': self.sparsegen_params, 'lr': self.lr, 'name': 'sparsegen_params'},
             ], weight_decay=self.weight_decay)
 
             scheduler = torch.optim.lr_scheduler.MultiStepLR(
                 optimizer, self.lr_step, self.lr_factor)
+            return {'optimizer': optimizer, 'lr_scheduler': scheduler}
         else:
-            optimizer = torch.optim.AdamW(
-                self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                optimizer, self.lr_step, self.lr_factor)
+            if self.lr_scheduler_name == "MultiStepLR":
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                optimizer = torch.optim.AdamW(
+                    trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+                
 
-        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+                scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                    optimizer, self.lr_step, self.lr_factor)
+            
+                return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+            elif self.lr_scheduler_name == "MultiStepLR_then_CosineAnnealingLR":
+                total_steps = self.trainer.estimated_stepping_batches
+                steps_per_epoch = total_steps // self.trainer.max_epochs
+                first_stage_steps = self.MultiStepLR_epoch_num * steps_per_epoch
+
+                multistep_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                    optimizer,
+                    milestones=[steps_per_epoch],   # 第1个epoch结束附近衰减一次
+                    gamma=self.lr_factor,
+                )
+                cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(1, total_steps - first_stage_steps),
+                    eta_min=self.eta_min,
+                )
+
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[multistep_scheduler, cosine_scheduler],
+                    milestones=[first_stage_steps],
+                )
+
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "interval": "step",
+                        "frequency": 1,
+                    },
+                }
+            
+            else:
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                optimizer = torch.optim.AdamW(
+                    trainable_params, lr=self.lr, weight_decay=self.weight_decay)
+                total_steps = self.trainer.estimated_stepping_batches
+                # import pdb; pdb.set_trace()
+                if self.use_warmup:
+                    warmup_steps = max(1, int(total_steps * self.warmup_ratio))
+
+                    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                        optimizer,
+                        start_factor=0.1,
+                        end_factor=1.0,
+                        total_iters=warmup_steps,
+                    )
+
+                    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer,
+                        T_max=max(1, total_steps - warmup_steps),
+                        eta_min=self.eta_min,
+                    )
+
+                    scheduler = torch.optim.lr_scheduler.SequentialLR(
+                        optimizer,
+                        schedulers=[warmup_scheduler, cosine_scheduler],
+                        milestones=[warmup_steps],
+                    )
+                else:
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                                optimizer,
+                                T_max=max(1, total_steps),
+                                eta_min=self.eta_min,
+                            )
+                return {
+                        "optimizer": optimizer,
+                        "lr_scheduler": {
+                            "scheduler": scheduler,
+                            "interval": "step",   # 按 optimizer.step() 更新
+                            "frequency": 1,
+                        },
+                    }
+        # return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     def configure_gradient_clipping(self, optimizer, gradient_clip_val, gradient_clip_algorithm):
         self.clip_gradients(
@@ -190,7 +293,7 @@ class Finetuner(LightningModule):
             loss, logits, _, all_hidden_states, all_attentions, all_loraout_dicts = outputs
             
         if not loss:
-            if self.dataset in ['mmlu_pro', 'arc_e', 'arc_c', 'commonsenseqa', 'openbookqa', 'swag', 'hellaswag', 'flanv2']:
+            if self.dataset in ['mmlu_pro', 'arc_e', 'arc_c', 'commonsenseqa', 'openbookqa', 'swag', 'hellaswag', 'flanv2', 'mmlu']:
                 if self.training and self.criterion:
                     logits = logits[:, :-1]
                     loss = self.criterion(
@@ -280,6 +383,9 @@ class Finetuner(LightningModule):
     def on_validation_epoch_end(self):
         if self.validator:
             rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            # total_right = sum(v["right_count"] for v in self.validator.metrics.values())
+            # total_all = sum(v["all_count"] for v in self.validator.metrics.values())
+            # print(f"[val end] rank={rank}, right={total_right}, all={total_all}")
             log = {}
             if rank == 0:
                 metric = self.validator.get_results()
@@ -368,6 +474,7 @@ def run(cfg: DictConfig):
     callbacks = [lr_monitor, saving_cb]
     if num_gpus > 1 and torch.cuda.is_available():
         dist_backend = cfg.get("dist_backend", "nccl")
+        # strategy = DDPStrategy(process_group_backend=dist_backend, find_unused_parameters=True)
         strategy = DDPStrategy(process_group_backend=dist_backend)
     else:
         strategy = "auto"

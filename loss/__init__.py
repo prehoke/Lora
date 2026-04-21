@@ -3,7 +3,7 @@ from .loss import *
 def build_loss(cfg):
     criterion = None
     dataset = cfg.dataset.name
-    if dataset in ['mmlu_pro', 'arc_e', 'arc_c', 'commonsenseqa', 'openbookqa', 'swag', 'hellaswag'] or \
+    if dataset in ['mmlu_pro', 'arc_e', 'arc_c', 'commonsenseqa', 'openbookqa', 'swag', 'hellaswag', 'mmlu'] or \
         dataset == 'glue' or dataset == 'flanv2':
         criterion = CompositeLoss()
         ce_loss_fn = CrossEntropyLoss(
@@ -26,7 +26,7 @@ def build_loss(cfg):
         if rz_loss_coef > 0:
             criterion.add_loss(rz_loss_fn, weight=rz_loss_coef)
         if lam_loss_coef > 0:
-            lam_loss_fn = LamSparseLoss()
+            # lam_loss_fn = LamSparseLoss()
             criterion.add_loss(lam_loss_fn, weight=lam_loss_coef)
 
     return criterion
